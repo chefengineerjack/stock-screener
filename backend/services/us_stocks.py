@@ -44,11 +44,7 @@ def fetch_us_stock_data(tickers: list[str], period: str = "1y") -> dict[str, pd.
             if raw.empty:
                 continue
 
-            if len(batch) == 1:
-                ticker = batch[0]
-                if not raw.empty:
-                    results[ticker] = raw.copy()
-            else:
+            if isinstance(raw.columns, pd.MultiIndex):
                 for ticker in batch:
                     try:
                         if ticker in raw.columns.get_level_values(0):
@@ -57,27 +53,28 @@ def fetch_us_stock_data(tickers: list[str], period: str = "1y") -> dict[str, pd.
                                 results[ticker] = df
                     except Exception:
                         pass
+            else:
+                # Single ticker: flat column structure
+                if len(batch) == 1:
+                    df = raw.dropna(how="all")
+                    if not df.empty and len(df) >= 20:
+                        results[batch[0]] = df
         except Exception as e:
             logger.warning(f"Batch download failed for {batch[:3]}...: {e}")
 
     return results
 
 
-def get_stock_info(ticker: str) -> dict:
-    """個別銘柄の情報取得"""
-    try:
-        info = yf.Ticker(ticker).info
-        return {
-            "name": info.get("longName") or info.get("shortName", ticker),
-            "sector": info.get("sector", "N/A"),
-        }
-    except Exception:
-        return {"name": ticker, "sector": "N/A"}
-
-
-def get_us_stock_metadata(tickers: list[str]) -> dict[str, dict]:
-    """複数銘柄のメタデータを取得"""
-    meta = {}
+def fetch_stock_info_batch(tickers: list[str]) -> dict[str, dict]:
+    """合致銘柄の名前・セクター情報を取得（ヒット後の少数銘柄のみ呼ぶ）"""
+    result = {}
     for ticker in tickers:
-        meta[ticker] = get_stock_info(ticker)
-    return meta
+        try:
+            info = yf.Ticker(ticker).info
+            result[ticker] = {
+                "name": info.get("longName") or info.get("shortName") or ticker,
+                "sector": info.get("sector") or "N/A",
+            }
+        except Exception:
+            result[ticker] = {"name": ticker, "sector": "N/A"}
+    return result

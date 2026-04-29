@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 from datetime import datetime
 from typing import Optional, AsyncIterator
@@ -7,87 +8,117 @@ from sqlalchemy.orm import Session
 from backend import models
 from backend.schemas import StockResult
 from backend.services.indicators import calculate_indicators, check_condition
-from backend.services.us_stocks import get_sp500_tickers, fetch_us_stock_data
+from backend.services.us_stocks import get_sp500_tickers, fetch_us_stock_data, fetch_stock_info_batch
 from backend.config import get_settings
 
 logger = logging.getLogger(__name__)
 
 
-async def run_screening(
+async def stream_screening_raw(
     pattern_id: int,
+    market: str,
+    logic: str,
+    conditions_data: list[dict],
+    tickers: Optional[list[str]],
     db: Session,
-    tickers: Optional[list[str]] = None,
-) -> list[StockResult]:
-    """スクリーニング実行（メイン関数）"""
-    pattern = db.query(models.Pattern).filter(models.Pattern.id == pattern_id).first()
-    if not pattern:
-        raise ValueError(f"Pattern {pattern_id} not found")
+) -> AsyncIterator[dict]:
+    """
+    プレーンな dict データでスクリーニングをSSEストリーム配信する。
+    SQLAlchemy オブジェクトは一切受け取らず、独立したセッションで動作する。
+    """
+    if not conditions_data:
+        yield {"type": "done", "results": [], "executed_at": datetime.utcnow().isoformat()}
+        return
 
-    conditions = pattern.conditions
-    if not conditions:
-        return []
-
-    if pattern.market == "US":
-        return await _screen_us_stocks(pattern, conditions, tickers)
-    elif pattern.market == "JP":
-        return await _screen_jp_stocks(pattern, conditions, tickers)
+    if market == "US":
+        async for event in _stream_us_stocks(pattern_id, logic, conditions_data, tickers, db):
+            yield event
+    elif market == "JP":
+        async for event in _stream_jp_stocks(pattern_id, logic, conditions_data, tickers, db):
+            yield event
     else:
-        raise ValueError(f"Unknown market: {pattern.market}")
+        yield {"type": "error", "message": f"Unknown market: {market}"}
 
 
-async def _screen_us_stocks(
-    pattern: models.Pattern,
-    conditions: list[models.Condition],
+async def _stream_us_stocks(
+    pattern_id: int,
+    logic: str,
+    conditions_data: list[dict],
     tickers: Optional[list[str]],
-) -> list[StockResult]:
+    db: Session,
+) -> AsyncIterator[dict]:
     target_tickers = tickers or get_sp500_tickers()
-
+    total = len(target_tickers)
+    all_results: list[StockResult] = []
     loop = asyncio.get_event_loop()
-    all_data = await loop.run_in_executor(None, fetch_us_stock_data, target_tickers)
+    batch_size = 50
 
-    results = []
-    for ticker, df in all_data.items():
-        try:
-            df_with_indicators = calculate_indicators(df)
-            match_reasons = _evaluate_conditions(df_with_indicators, conditions, pattern.logic)
+    yield {"type": "start", "total": total}
 
-            if match_reasons is None:
-                continue
+    for i in range(0, total, batch_size):
+        batch = target_tickers[i:i + batch_size]
+        batch_data: dict = await loop.run_in_executor(None, fetch_us_stock_data, batch)
 
-            last = df_with_indicators.iloc[-1]
-            prev = df_with_indicators.iloc[-2] if len(df_with_indicators) >= 2 else last
+        batch_hits: list[tuple] = []
+        for ticker, df in batch_data.items():
+            try:
+                df_ind = calculate_indicators(df)
+                match_reasons = _evaluate_conditions(df_ind, conditions_data, logic)
+                if match_reasons is None:
+                    continue
+                last = df_ind.iloc[-1]
+                prev = df_ind.iloc[-2] if len(df_ind) >= 2 else last
+                price = float(last["Close"])
+                change_1d = (
+                    float((last["Close"] - prev["Close"]) / prev["Close"] * 100)
+                    if float(prev["Close"]) != 0 else 0.0
+                )
+                batch_hits.append((ticker, price, change_1d, match_reasons))
+            except Exception as e:
+                logger.debug(f"Error processing {ticker}: {e}")
 
-            price = float(last["Close"])
-            change_1d = float(
-                (last["Close"] - prev["Close"]) / prev["Close"] * 100
-            ) if prev["Close"] != 0 else 0.0
+        processed = min(i + len(batch), total)
 
-            results.append(StockResult(
-                symbol=ticker,
-                name=ticker,
-                price=round(price, 2),
-                change_1d=round(change_1d, 2),
-                sector="N/A",
-                match_reasons=match_reasons,
-            ))
-        except Exception as e:
-            logger.debug(f"Error processing {ticker}: {e}")
+        # ヒット銘柄の名前・セクターを取得（少数なので許容）
+        if batch_hits:
+            matched_tickers = [h[0] for h in batch_hits]
+            info_map: dict = await loop.run_in_executor(None, fetch_stock_info_batch, matched_tickers)
+            for ticker, price, change_1d, match_reasons in batch_hits:
+                info = info_map.get(ticker, {"name": ticker, "sector": "N/A"})
+                all_results.append(StockResult(
+                    symbol=ticker,
+                    name=info["name"],
+                    price=round(price, 2),
+                    change_1d=round(change_1d, 2),
+                    sector=info["sector"],
+                    match_reasons=match_reasons,
+                ))
 
-    return results
+        yield {"type": "progress", "current": processed, "total": total}
+
+    _save_results(pattern_id, all_results, db)
+
+    yield {
+        "type": "done",
+        "results": [r.model_dump() for r in all_results],
+        "executed_at": datetime.utcnow().isoformat(),
+    }
 
 
-async def _screen_jp_stocks(
-    pattern: models.Pattern,
-    conditions: list[models.Condition],
+async def _stream_jp_stocks(
+    pattern_id: int,
+    logic: str,
+    conditions_data: list[dict],
     tickers: Optional[list[str]],
-) -> list[StockResult]:
+    db: Session,
+) -> AsyncIterator[dict]:
     settings = get_settings()
     if not settings.jquants_email or not settings.jquants_password:
-        raise ValueError("J-Quants credentials not configured")
+        yield {"type": "error", "message": "J-Quants credentials not configured"}
+        return
 
     from backend.services.jp_stocks import get_jquants_client
     client = get_jquants_client(settings.jquants_email, settings.jquants_password)
-
     loop = asyncio.get_event_loop()
 
     if tickers:
@@ -97,74 +128,87 @@ async def _screen_jp_stocks(
 
     stock_map = {s["Code"]: s for s in stock_list}
     target_codes = list(stock_map.keys())[:500]
+    total = len(target_codes)
+    all_results: list[StockResult] = []
 
-    results = []
+    yield {"type": "start", "total": total}
+
+    batch_size = 20
     semaphore = asyncio.Semaphore(10)
 
-    async def process_stock(code: str):
+    async def process_code(code: str) -> Optional[StockResult]:
         async with semaphore:
             try:
                 df = await loop.run_in_executor(None, client.get_daily_quotes_df, code)
                 if df.empty or len(df) < 20:
                     return None
-
-                df_with_indicators = calculate_indicators(df)
-                match_reasons = _evaluate_conditions(df_with_indicators, conditions, pattern.logic)
-
+                df_ind = calculate_indicators(df)
+                match_reasons = _evaluate_conditions(df_ind, conditions_data, logic)
                 if match_reasons is None:
                     return None
-
-                last = df_with_indicators.iloc[-1]
-                prev = df_with_indicators.iloc[-2] if len(df_with_indicators) >= 2 else last
-
+                last = df_ind.iloc[-1]
+                prev = df_ind.iloc[-2] if len(df_ind) >= 2 else last
                 price = float(last["Close"])
-                change_1d = float(
-                    (last["Close"] - prev["Close"]) / prev["Close"] * 100
-                ) if prev["Close"] != 0 else 0.0
-
-                stock_info = stock_map.get(code, {})
+                change_1d = (
+                    float((last["Close"] - prev["Close"]) / prev["Close"] * 100)
+                    if float(prev["Close"]) != 0 else 0.0
+                )
+                info = stock_map.get(code, {})
                 return StockResult(
                     symbol=code,
-                    name=stock_info.get("CompanyName", code),
+                    name=info.get("CompanyName", code),
                     price=round(price, 2),
                     change_1d=round(change_1d, 2),
-                    sector=stock_info.get("Sector17CodeName", "N/A"),
+                    sector=info.get("Sector17CodeName", "N/A"),
                     match_reasons=match_reasons,
                 )
             except Exception as e:
                 logger.debug(f"Error processing JP stock {code}: {e}")
                 return None
 
-    tasks = [process_stock(code) for code in target_codes]
-    batch_results = await asyncio.gather(*tasks, return_exceptions=False)
+    for i in range(0, total, batch_size):
+        batch = target_codes[i:i + batch_size]
+        batch_results = await asyncio.gather(*[process_code(c) for c in batch])
+        for r in batch_results:
+            if r is not None:
+                all_results.append(r)
+        yield {"type": "progress", "current": min(i + batch_size, total), "total": total}
 
-    for r in batch_results:
-        if r is not None:
-            results.append(r)
+    _save_results(pattern_id, all_results, db)
 
-    return results
+    yield {
+        "type": "done",
+        "results": [r.model_dump() for r in all_results],
+        "executed_at": datetime.utcnow().isoformat(),
+    }
 
 
-def _evaluate_conditions(
-    df,
-    conditions: list[models.Condition],
-    logic: str,
-) -> Optional[list[str]]:
-    """条件を評価してヒットした条件のラベルリストを返す（非ヒットはNone）"""
-    if not conditions:
+def _evaluate_conditions(df, conditions_data: list[dict], logic: str) -> Optional[list[str]]:
+    """条件を評価してヒットしたラベルのリストを返す（非ヒットはNone）"""
+    if not conditions_data:
         return None
 
     hit_reasons = []
-    for cond in conditions:
-        matched = check_condition(df, cond.condition_type, cond.params or {})
+    for cond in conditions_data:
+        matched = check_condition(df, cond["condition_type"], cond.get("params") or {})
         if matched:
-            hit_reasons.append(cond.label)
+            hit_reasons.append(cond["label"])
 
     if logic == "AND":
-        if len(hit_reasons) == len(conditions):
-            return hit_reasons
-        return None
-    else:  # OR
-        if hit_reasons:
-            return hit_reasons
-        return None
+        return hit_reasons if len(hit_reasons) == len(conditions_data) else None
+    else:
+        return hit_reasons if hit_reasons else None
+
+
+def _save_results(pattern_id: int, results: list[StockResult], db: Session) -> None:
+    try:
+        db_result = models.ScreeningResult(
+            pattern_id=pattern_id,
+            executed_at=datetime.utcnow(),
+            results_json=json.dumps([r.model_dump() for r in results], default=str),
+        )
+        db.add(db_result)
+        db.commit()
+    except Exception as e:
+        logger.error(f"Failed to save screening result: {e}")
+        db.rollback()
