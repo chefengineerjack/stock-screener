@@ -5,7 +5,7 @@ interface Props {
   onToggle: (condition: PresetCondition) => void;
 }
 
-const CATEGORIES = ["RSI", "移動平均", "価格帯", "出来高", "MACD", "ボリンジャーバンド"];
+const CATEGORIES = ["RSI", "移動平均", "価格帯", "出来高", "MACD", "ボリンジャーバンド", "ファンダメンタルズ"];
 
 export function ConditionSelector({ selected, onToggle }: Props) {
   return (

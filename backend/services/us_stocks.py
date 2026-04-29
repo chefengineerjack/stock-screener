@@ -1,5 +1,6 @@
 import yfinance as yf
 import pandas as pd
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 import logging
 
@@ -44,11 +45,7 @@ def fetch_us_stock_data(tickers: list[str], period: str = "1y") -> dict[str, pd.
             if raw.empty:
                 continue
 
-            if len(batch) == 1:
-                ticker = batch[0]
-                if not raw.empty:
-                    results[ticker] = raw.copy()
-            else:
+            if isinstance(raw.columns, pd.MultiIndex):
                 for ticker in batch:
                     try:
                         if ticker in raw.columns.get_level_values(0):
@@ -57,27 +54,45 @@ def fetch_us_stock_data(tickers: list[str], period: str = "1y") -> dict[str, pd.
                                 results[ticker] = df
                     except Exception:
                         pass
+            else:
+                # Single ticker: flat column structure
+                if len(batch) == 1:
+                    df = raw.dropna(how="all")
+                    if not df.empty and len(df) >= 20:
+                        results[batch[0]] = df
         except Exception as e:
             logger.warning(f"Batch download failed for {batch[:3]}...: {e}")
 
     return results
 
 
-def get_stock_info(ticker: str) -> dict:
-    """個別銘柄の情報取得"""
+def fetch_ticker_data(ticker: str) -> dict:
+    """単一銘柄の名前・セクター・ファンダメンタルズ情報を取得"""
     try:
         info = yf.Ticker(ticker).info
         return {
-            "name": info.get("longName") or info.get("shortName", ticker),
-            "sector": info.get("sector", "N/A"),
+            "name": info.get("longName") or info.get("shortName") or ticker,
+            "sector": info.get("sector") or "N/A",
+            "pe_ratio": info.get("trailingPE") or info.get("forwardPE"),
+            "pb_ratio": info.get("priceToBook"),
+            "dividend_yield": info.get("dividendYield"),
+            "profit_margins": info.get("profitMargins"),
+            "revenue_growth": info.get("revenueGrowth"),
+            "market_cap": info.get("marketCap"),
+            "debt_to_equity": info.get("debtToEquity"),
         }
     except Exception:
         return {"name": ticker, "sector": "N/A"}
 
 
-def get_us_stock_metadata(tickers: list[str]) -> dict[str, dict]:
-    """複数銘柄のメタデータを取得"""
-    meta = {}
-    for ticker in tickers:
-        meta[ticker] = get_stock_info(ticker)
-    return meta
+def fetch_ticker_data_batch(tickers: list[str]) -> dict[str, dict]:
+    """複数銘柄のファンダメンタルズ情報を並列取得"""
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {t: executor.submit(fetch_ticker_data, t) for t in tickers}
+        return {t: f.result() for t, f in futures.items()}
+
+
+def fetch_stock_info_batch(tickers: list[str]) -> dict[str, dict]:
+    """合致銘柄の名前・セクター情報を取得（後方互換）"""
+    result = fetch_ticker_data_batch(tickers)
+    return {t: {"name": d["name"], "sector": d["sector"]} for t, d in result.items()}

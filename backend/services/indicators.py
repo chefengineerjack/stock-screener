@@ -1,6 +1,12 @@
 import pandas as pd
 import numpy as np
 
+FUNDAMENTAL_CONDITIONS = frozenset([
+    "per_low", "per_high", "pbr_low", "dividend_high",
+    "profit_margin_high", "revenue_growth", "market_cap_large",
+    "market_cap_small", "debt_equity_low",
+])
+
 
 def _sma(series: pd.Series, length: int) -> pd.Series:
     return series.rolling(window=length, min_periods=length).mean()
@@ -33,7 +39,7 @@ def _bbands(series: pd.Series, length: int = 20, std: float = 2.0):
     rolling_std = series.rolling(window=length, min_periods=length).std()
     upper = mid + std * rolling_std
     lower = mid - std * rolling_std
-    return upper, lower
+    return upper, mid, lower
 
 
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -62,8 +68,9 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
         df["MACD_signal"] = signal_line
 
     if len(df) >= 20:
-        bb_upper, bb_lower = _bbands(close, 20, 2.0)
+        bb_upper, bb_mid, bb_lower = _bbands(close, 20, 2.0)
         df["BB_upper"] = bb_upper
+        df["BB_mid"] = bb_mid
         df["BB_lower"] = bb_lower
         df["Volume_MA20"] = _sma(volume, 20)
 
@@ -77,8 +84,11 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def check_condition(df: pd.DataFrame, condition_type: str, params: dict) -> bool:
+def check_condition(df: pd.DataFrame, condition_type: str, params: dict, fundamentals: dict = {}) -> bool:
     """単一条件の判定"""
+    if condition_type in FUNDAMENTAL_CONDITIONS:
+        return _check_fundamental(condition_type, params, fundamentals)
+
     if df.empty or len(df) < 2:
         return False
 
@@ -101,6 +111,9 @@ def check_condition(df: pd.DataFrame, condition_type: str, params: dict) -> bool
         "macd_bearish": _macd_bearish,
         "bb_upper": _bb_upper,
         "bb_lower": _bb_lower,
+        "bb_squeeze": _bb_squeeze,
+        "bb_walk_up": _bb_walk_up,
+        "bb_walk_down": _bb_walk_down,
     }
 
     handler = handlers.get(condition_type)
@@ -116,6 +129,22 @@ def check_condition(df: pd.DataFrame, condition_type: str, params: dict) -> bool
 def _safe(val) -> bool:
     return val is not None and not (isinstance(val, float) and np.isnan(val))
 
+
+def _check_lt(val, threshold) -> bool:
+    try:
+        return val is not None and not np.isnan(float(val)) and float(val) < float(threshold)
+    except Exception:
+        return False
+
+
+def _check_gt(val, threshold) -> bool:
+    try:
+        return val is not None and not np.isnan(float(val)) and float(val) > float(threshold)
+    except Exception:
+        return False
+
+
+# --- Technical conditions ---
 
 def _rsi_oversold(df, last, params):
     threshold = params.get("threshold", 30)
@@ -230,3 +259,115 @@ def _bb_upper(df, last, params):
 
 def _bb_lower(df, last, params):
     return _safe(last.get("BB_lower")) and last["Close"] < last["BB_lower"]
+
+
+def _bb_squeeze(df, last, params):
+    """バンド幅が過去120日間の20パーセンタイル以下のスクイーズ状態"""
+    lookback = params.get("lookback", 120)
+    percentile = params.get("percentile", 20)
+    if "BB_upper" not in df.columns or "BB_lower" not in df.columns or "BB_mid" not in df.columns:
+        return False
+    window = df.tail(lookback)
+    if len(window) < 20:
+        return False
+    bandwidth = (window["BB_upper"] - window["BB_lower"]) / window["BB_mid"].replace(0, np.nan)
+    bandwidth = bandwidth.dropna()
+    if bandwidth.empty:
+        return False
+    current_bw = bandwidth.iloc[-1]
+    threshold = np.percentile(bandwidth.values, percentile)
+    return _safe(current_bw) and float(current_bw) <= float(threshold)
+
+
+def _bb_walk_up(df, last, params):
+    """直近5日間のうち4日以上終値がBBアッパーバンド上"""
+    days = params.get("days", 5)
+    min_count = params.get("min_count", 4)
+    if "BB_upper" not in df.columns:
+        return False
+    window = df.tail(days)
+    if len(window) < days:
+        return False
+    count = (window["Close"] > window["BB_upper"]).sum()
+    return int(count) >= min_count
+
+
+def _bb_walk_down(df, last, params):
+    """直近5日間のうち4日以上終値がBBロワーバンド下"""
+    days = params.get("days", 5)
+    min_count = params.get("min_count", 4)
+    if "BB_lower" not in df.columns:
+        return False
+    window = df.tail(days)
+    if len(window) < days:
+        return False
+    count = (window["Close"] < window["BB_lower"]).sum()
+    return int(count) >= min_count
+
+
+# --- Fundamental conditions ---
+
+def _check_fundamental(condition_type: str, params: dict, fundamentals: dict) -> bool:
+    handlers = {
+        "per_low": _per_low,
+        "per_high": _per_high,
+        "pbr_low": _pbr_low,
+        "dividend_high": _dividend_high,
+        "profit_margin_high": _profit_margin_high,
+        "revenue_growth": _revenue_growth,
+        "market_cap_large": _market_cap_large,
+        "market_cap_small": _market_cap_small,
+        "debt_equity_low": _debt_equity_low,
+    }
+    handler = handlers.get(condition_type)
+    if handler is None:
+        return False
+    try:
+        return handler(params, fundamentals)
+    except Exception:
+        return False
+
+
+def _per_low(params, f):
+    threshold = params.get("threshold", 15)
+    return _check_lt(f.get("pe_ratio"), threshold)
+
+
+def _per_high(params, f):
+    threshold = params.get("threshold", 30)
+    return _check_gt(f.get("pe_ratio"), threshold)
+
+
+def _pbr_low(params, f):
+    threshold = params.get("threshold", 1.0)
+    return _check_lt(f.get("pb_ratio"), threshold)
+
+
+def _dividend_high(params, f):
+    threshold = params.get("threshold", 0.03)
+    return _check_gt(f.get("dividend_yield"), threshold)
+
+
+def _profit_margin_high(params, f):
+    threshold = params.get("threshold", 0.20)
+    return _check_gt(f.get("profit_margins"), threshold)
+
+
+def _revenue_growth(params, f):
+    threshold = params.get("threshold", 0.10)
+    return _check_gt(f.get("revenue_growth"), threshold)
+
+
+def _market_cap_large(params, f):
+    threshold = params.get("threshold", 10_000_000_000)
+    return _check_gt(f.get("market_cap"), threshold)
+
+
+def _market_cap_small(params, f):
+    threshold = params.get("threshold", 2_000_000_000)
+    return _check_lt(f.get("market_cap"), threshold)
+
+
+def _debt_equity_low(params, f):
+    threshold = params.get("threshold", 0.5)
+    return _check_lt(f.get("debt_to_equity"), threshold)

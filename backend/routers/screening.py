@@ -2,49 +2,56 @@ import json
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
-from sqlalchemy.orm import Session
-from backend.database import get_db
+from sqlalchemy.orm import Session, selectinload
+from backend.database import get_db, SessionLocal
 from backend import models, schemas
-from backend.services.screener import run_screening
+from backend.services.screener import stream_screening_raw
 
 router = APIRouter()
 
 
-@router.post("/run", response_model=schemas.ScreeningResponse)
-async def run_screening_endpoint(
+@router.post("/run-stream")
+async def run_screening_stream(
     request: schemas.ScreeningRequest,
     db: Session = Depends(get_db),
 ):
-    pattern = db.query(models.Pattern).filter(models.Pattern.id == request.pattern_id).first()
+    """SSEでスクリーニング進捗をストリーム配信するエンドポイント"""
+    # セッションが生きているうちにすべてのデータを取得・シリアライズ
+    pattern = (
+        db.query(models.Pattern)
+        .options(selectinload(models.Pattern.conditions))
+        .filter(models.Pattern.id == request.pattern_id)
+        .first()
+    )
     if not pattern:
         raise HTTPException(status_code=404, detail="Pattern not found")
 
-    try:
-        results = await run_screening(
-            pattern_id=request.pattern_id,
-            db=db,
-            tickers=request.tickers,
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Screening failed: {str(e)}")
+    pattern_id = pattern.id
+    market = pattern.market
+    logic = pattern.logic
+    conditions_data = [
+        {"condition_type": c.condition_type, "label": c.label, "params": c.params or {}}
+        for c in pattern.conditions
+    ]
+    tickers = request.tickers
 
-    executed_at = datetime.utcnow()
-    results_data = [r.model_dump() for r in results]
+    async def generate():
+        # ストリーミング中は独立したセッションを使う
+        stream_db = SessionLocal()
+        try:
+            async for event in stream_screening_raw(
+                pattern_id, market, logic, conditions_data, tickers, stream_db
+            ):
+                yield f"data: {json.dumps(event, default=str)}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+        finally:
+            stream_db.close()
 
-    db_result = models.ScreeningResult(
-        pattern_id=request.pattern_id,
-        executed_at=executed_at,
-        results_json=json.dumps(results_data, default=str),
-    )
-    db.add(db_result)
-    db.commit()
-
-    return schemas.ScreeningResponse(
-        results=results,
-        executed_at=executed_at,
-        pattern_id=request.pattern_id,
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 

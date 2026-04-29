@@ -5,6 +5,7 @@ from functools import lru_cache
 class Settings(BaseSettings):
     jquants_email: str = ""
     jquants_password: str = ""
+    jquants_api_key: str = ""
     database_url: str = "sqlite:///./screener.db"
 
     class Config:

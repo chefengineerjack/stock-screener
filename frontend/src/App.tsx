@@ -4,25 +4,31 @@ import { Header } from "./components/Header";
 import { PatternList } from "./components/PatternList";
 import { PatternForm } from "./components/PatternForm";
 import { ScreeningResult, ScreeningHistory } from "./components/ScreeningResult";
+import { ProgressBar } from "./components/ProgressBar";
 import { usePatterns } from "./hooks/usePatterns";
 import { api } from "./api/client";
 import type { PatternCreate, StockResult, ScreeningHistoryItem } from "./types";
 
 type ViewMode = "detail" | "form" | "new";
 
+interface ScreeningState {
+  running: boolean;
+  progress: { current: number; total: number } | null;
+  results: StockResult[];
+  executedAt?: string;
+  error?: string;
+}
+
 export default function App() {
   const { patterns, loading, createPattern, updatePattern, deletePattern } = usePatterns();
 
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>("detail");
-
-  const [screening, setScreening] = useState<{
-    running: boolean;
-    results: StockResult[];
-    executedAt?: string;
-    error?: string;
-  }>({ running: false, results: [] });
-
+  const [screening, setScreening] = useState<ScreeningState>({
+    running: false,
+    progress: null,
+    results: [],
+  });
   const [history, setHistory] = useState<ScreeningHistoryItem[]>([]);
   const [showHistory, setShowHistory] = useState(false);
 
@@ -31,7 +37,7 @@ export default function App() {
   const handleSelect = useCallback((id: number) => {
     setSelectedId(id);
     setViewMode("detail");
-    setScreening({ running: false, results: [] });
+    setScreening({ running: false, progress: null, results: [] });
   }, []);
 
   const handleNew = useCallback(() => {
@@ -62,13 +68,32 @@ export default function App() {
 
   const handleRunScreening = useCallback(async () => {
     if (!selectedPattern) return;
-    setScreening({ running: true, results: [] });
+    setScreening({ running: true, progress: null, results: [] });
+
     try {
-      const res = await api.screening.run(selectedPattern.id);
-      setScreening({ running: false, results: res.results, executedAt: res.executed_at });
+      for await (const event of api.screening.stream(selectedPattern.id)) {
+        if (event.type === "start") {
+          setScreening((prev) => ({ ...prev, progress: { current: 0, total: event.total } }));
+        } else if (event.type === "progress") {
+          setScreening((prev) => ({
+            ...prev,
+            progress: { current: event.current, total: event.total },
+          }));
+        } else if (event.type === "done") {
+          setScreening({
+            running: false,
+            progress: null,
+            results: event.results,
+            executedAt: event.executed_at,
+          });
+        } else if (event.type === "error") {
+          setScreening({ running: false, progress: null, results: [], error: event.message });
+        }
+      }
     } catch (e) {
       setScreening({
         running: false,
+        progress: null,
         results: [],
         error: e instanceof Error ? e.message : "スクリーニング実行中にエラーが発生しました",
       });
@@ -173,7 +198,7 @@ export default function App() {
                           <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                           <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
                         </svg>
-                        スクリーニング実行中...
+                        実行中...
                       </>
                     ) : (
                       <>
@@ -192,6 +217,16 @@ export default function App() {
                     実行履歴
                   </button>
                 </div>
+
+                {/* 進捗バー */}
+                {screening.running && screening.progress && (
+                  <div className="mt-4 pt-4 border-t border-gray-100">
+                    <ProgressBar
+                      current={screening.progress.current}
+                      total={screening.progress.total}
+                    />
+                  </div>
+                )}
               </div>
 
               {screening.error && (
@@ -200,22 +235,20 @@ export default function App() {
                 </div>
               )}
 
-              {(screening.results.length > 0 || screening.running) && (
+              {screening.results.length > 0 && (
                 <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
                   <h3 className="text-base font-semibold text-gray-800 mb-4">スクリーニング結果</h3>
-                  {screening.running ? (
-                    <div className="flex items-center gap-3 py-8 justify-center text-gray-400">
-                      <svg className="w-5 h-5 animate-spin" fill="none" viewBox="0 0 24 24">
-                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-                      </svg>
-                      <span className="text-sm">データを取得してスクリーニング中...</span>
-                    </div>
-                  ) : (
-                    <ScreeningResult results={screening.results} executedAt={screening.executedAt} />
-                  )}
+                  <ScreeningResult results={screening.results} executedAt={screening.executedAt} />
                 </div>
               )}
+
+              {!screening.running && !screening.error && screening.results.length === 0 &&
+                screening.executedAt && (
+                  <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
+                    <h3 className="text-base font-semibold text-gray-800 mb-4">スクリーニング結果</h3>
+                    <ScreeningResult results={[]} executedAt={screening.executedAt} />
+                  </div>
+                )}
 
               {showHistory && (
                 <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
