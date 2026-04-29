@@ -39,3 +39,10 @@ class ScreeningResult(Base):
     results_json = Column(Text, nullable=False, default="[]")
 
     pattern = relationship("Pattern", back_populates="screening_results")
+
+
+class AppState(Base):
+    __tablename__ = "app_state"
+
+    key = Column(String, primary_key=True)
+    value = Column(String)

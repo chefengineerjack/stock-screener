@@ -3,7 +3,6 @@ import pandas as pd
 from datetime import datetime, timedelta
 from typing import Optional
 import logging
-import functools
 import time
 
 logger = logging.getLogger(__name__)
@@ -24,38 +23,11 @@ def _cached(key: str, fn, ttl: int = _cache_ttl):
 class JQuantsClient:
     BASE_URL = "https://api.jquants.com/v1"
 
-    def __init__(self, email: str, password: str):
-        self._email = email
-        self._password = password
-        self._token: Optional[str] = None
-        self._token_expires: float = 0
-
-    def _ensure_token(self):
-        if self._token and time.time() < self._token_expires:
-            return
-        self._token = self._authenticate()
-        self._token_expires = time.time() + 82800  # 23時間
-
-    def _authenticate(self) -> str:
-        resp = requests.post(
-            f"{self.BASE_URL}/token/auth_user",
-            json={"mailaddress": self._email, "password": self._password},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        refresh = resp.json()["refreshToken"]
-
-        resp2 = requests.post(
-            f"{self.BASE_URL}/token/auth_refresh",
-            params={"refreshtoken": refresh},
-            timeout=30,
-        )
-        resp2.raise_for_status()
-        return resp2.json()["idToken"]
+    def __init__(self, api_key: str):
+        self._api_key = api_key
 
     def _headers(self) -> dict:
-        self._ensure_token()
-        return {"Authorization": f"Bearer {self._token}"}
+        return {"Authorization": f"Bearer {self._api_key}"}
 
     def get_listed_stocks(self) -> list[dict]:
         """全上場銘柄一覧（キャッシュあり）"""
@@ -116,12 +88,84 @@ class JQuantsClient:
 
         return df.dropna(subset=["Close"])
 
+    def get_financial_statements(self, code: str) -> list[dict]:
+        """財務データ取得（/fins/statements）"""
+        cache_key = f"fins_{code}"
+
+        def fetch():
+            resp = requests.get(
+                f"{self.BASE_URL}/fins/statements",
+                params={"code": code},
+                headers=self._headers(),
+                timeout=30,
+            )
+            resp.raise_for_status()
+            return resp.json().get("statements", [])
+
+        return _cached(cache_key, fetch, ttl=86400)
+
+    def get_jp_fundamentals(self, code: str, current_price: float) -> dict:
+        """財務データからファンダメンタルズ指標を計算して返す"""
+        try:
+            statements = self.get_financial_statements(code)
+            if not statements:
+                return {}
+
+            # 最新の財務データを使用
+            latest = statements[-1] if statements else {}
+
+            def _safe_float(val):
+                try:
+                    return float(val) if val is not None else None
+                except Exception:
+                    return None
+
+            eps = _safe_float(latest.get("EarningsPerShare"))
+            bps = _safe_float(latest.get("BookValuePerShare"))
+            div_per_share = _safe_float(latest.get("DividendPerShare"))
+            net_sales = _safe_float(latest.get("NetSales"))
+            net_income = _safe_float(latest.get("NetIncome"))
+            equity = _safe_float(latest.get("Equity"))
+            total_liabilities = _safe_float(latest.get("TotalLiabilities"))
+            shares = _safe_float(latest.get("NumberOfIssuedAndOutstandingSharesAtTheEndOfFiscalYearIncludingTreasuryStock"))
+
+            fundamentals: dict = {}
+
+            # PER
+            if eps and eps > 0 and current_price > 0:
+                fundamentals["pe_ratio"] = current_price / eps
+
+            # PBR
+            if bps and bps > 0 and current_price > 0:
+                fundamentals["pb_ratio"] = current_price / bps
+
+            # 配当利回り
+            if div_per_share and current_price > 0:
+                fundamentals["dividend_yield"] = div_per_share / current_price
+
+            # 利益率
+            if net_income and net_sales and net_sales > 0:
+                fundamentals["profit_margins"] = net_income / net_sales
+
+            # 時価総額
+            if shares and current_price > 0:
+                fundamentals["market_cap"] = shares * current_price
+
+            # D/Eレシオ
+            if total_liabilities and equity and equity > 0:
+                fundamentals["debt_to_equity"] = total_liabilities / equity
+
+            return fundamentals
+        except Exception as e:
+            logger.debug(f"Failed to get JP fundamentals for {code}: {e}")
+            return {}
+
 
 _client_instance: Optional[JQuantsClient] = None
 
 
-def get_jquants_client(email: str, password: str) -> JQuantsClient:
+def get_jquants_client(api_key: str) -> JQuantsClient:
     global _client_instance
     if _client_instance is None:
-        _client_instance = JQuantsClient(email, password)
+        _client_instance = JQuantsClient(api_key)
     return _client_instance

@@ -84,4 +84,18 @@ export const PRESET_CONDITIONS: PresetCondition[] = [
   // ボリンジャーバンド
   { type: "bb_upper", label: "ボリンジャー上限突破", category: "ボリンジャーバンド", params: {} },
   { type: "bb_lower", label: "ボリンジャー下限割れ", category: "ボリンジャーバンド", params: {} },
+  { type: "bb_squeeze", label: "BBスクイーズ（バンド幅収縮）", category: "ボリンジャーバンド", params: { lookback: 120, percentile: 20 } },
+  { type: "bb_walk_up", label: "BBバンドウォーク上昇", category: "ボリンジャーバンド", params: { days: 5, min_count: 4 } },
+  { type: "bb_walk_down", label: "BBバンドウォーク下降", category: "ボリンジャーバンド", params: { days: 5, min_count: 4 } },
+
+  // ファンダメンタルズ
+  { type: "per_low", label: "PER 割安 (< 15)", category: "ファンダメンタルズ", params: { threshold: 15 } },
+  { type: "per_high", label: "PER 割高 (> 30)", category: "ファンダメンタルズ", params: { threshold: 30 } },
+  { type: "pbr_low", label: "PBR 1倍割れ", category: "ファンダメンタルズ", params: { threshold: 1.0 } },
+  { type: "dividend_high", label: "高配当利回り (> 3%)", category: "ファンダメンタルズ", params: { threshold: 0.03 } },
+  { type: "profit_margin_high", label: "利益率高い (> 20%)", category: "ファンダメンタルズ", params: { threshold: 0.20 } },
+  { type: "revenue_growth", label: "売上高成長率 (> 10%)", category: "ファンダメンタルズ", params: { threshold: 0.10 } },
+  { type: "market_cap_large", label: "大型株 (時価総額 > $100億)", category: "ファンダメンタルズ", params: { threshold: 10000000000 } },
+  { type: "market_cap_small", label: "小型株 (時価総額 < $20億)", category: "ファンダメンタルズ", params: { threshold: 2000000000 } },
+  { type: "debt_equity_low", label: "低D/Eレシオ (< 0.5)", category: "ファンダメンタルズ", params: { threshold: 0.5 } },
 ];
