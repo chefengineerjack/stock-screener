@@ -21,13 +21,13 @@ def _cached(key: str, fn, ttl: int = _cache_ttl):
 
 
 class JQuantsClient:
-    BASE_URL = "https://api.jquants.com/v1"
+    BASE_URL = "https://api.jquants.com/v2"
 
     def __init__(self, api_key: str):
         self._api_key = api_key
 
     def _headers(self) -> dict:
-        return {"Authorization": f"Bearer {self._api_key}"}
+        return {"x-api-key": self._api_key}
 
     def get_listed_stocks(self) -> list[dict]:
         """全上場銘柄一覧（キャッシュあり）"""
@@ -48,13 +48,14 @@ class JQuantsClient:
 
         def fetch():
             resp = requests.get(
-                f"{self.BASE_URL}/prices/daily_quotes",
+                f"{self.BASE_URL}/equities/bars/daily",
                 params={"code": code, "from": from_date, "to": to_date},
                 headers=self._headers(),
                 timeout=30,
             )
             resp.raise_for_status()
-            return resp.json().get("daily_quotes", [])
+            # V2 レスポンスキーは "bars"
+            return resp.json().get("bars", [])
 
         return _cached(cache_key, fetch, ttl=_cache_ttl)
 
