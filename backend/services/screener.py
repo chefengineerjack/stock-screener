@@ -176,7 +176,7 @@ async def _stream_jp_stocks(
     has_fund = bool(fund_conds)
 
     if tickers:
-        stock_list = [{"Code": t, "CompanyName": t, "Sector17CodeName": "N/A"} for t in tickers]
+        stock_list = [{"Code": t, "CoName": t, "S17Nm": "N/A"} for t in tickers]
     else:
         stock_list = await loop.run_in_executor(None, client.get_listed_stocks)
 
@@ -250,10 +250,10 @@ async def _stream_jp_stocks(
 
                 return StockResult(
                     symbol=code,
-                    name=info.get("CompanyName", code),
+                    name=info.get("CoName", code),
                     price=round(price, 2),
                     change_1d=round(change_1d, 2),
-                    sector=info.get("Sector17CodeName", "N/A"),
+                    sector=info.get("S17Nm", "N/A"),
                     match_reasons=match_reasons,
                 )
             except Exception as e:
