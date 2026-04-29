@@ -6,7 +6,7 @@ import { PatternForm } from "./components/PatternForm";
 import { ScreeningResult, ScreeningHistory } from "./components/ScreeningResult";
 import { usePatterns } from "./hooks/usePatterns";
 import { api } from "./api/client";
-import type { Pattern, PatternCreate, StockResult, ScreeningHistoryItem } from "./types";
+import type { PatternCreate, StockResult, ScreeningHistoryItem } from "./types";
 
 type ViewMode = "detail" | "form" | "new";
 
