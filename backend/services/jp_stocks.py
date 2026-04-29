@@ -29,33 +29,36 @@ class JQuantsClient:
     def _headers(self) -> dict:
         return {"x-api-key": self._api_key}
 
-    def get_listed_stocks(self) -> list[dict]:
-        """全上場銘柄一覧（キャッシュあり）"""
-        def fetch():
-            resp = requests.get(
-                f"{self.BASE_URL}/listed/info",
-                headers=self._headers(),
-                timeout=30,
-            )
+    def _get_all_pages(self, url: str, params: dict) -> list[dict]:
+        """V2ページネーション対応の全件取得（pagination_keyカーソル方式）"""
+        all_data: list[dict] = []
+        while True:
+            resp = requests.get(url, params=params, headers=self._headers(), timeout=30)
             resp.raise_for_status()
-            return resp.json().get("info", [])
+            body = resp.json()
+            all_data.extend(body.get("data", []))
+            pagination_key = body.get("pagination_key")
+            if not pagination_key:
+                break
+            params = {**params, "pagination_key": pagination_key}
+        return all_data
+
+    def get_listed_stocks(self) -> list[dict]:
+        """全上場銘柄一覧（キャッシュあり） /v2/equities/master"""
+        def fetch():
+            return self._get_all_pages(f"{self.BASE_URL}/equities/master", {})
 
         return _cached("listed_stocks", fetch, ttl=86400)  # 24時間キャッシュ
 
     def get_daily_quotes(self, code: str, from_date: str, to_date: str) -> list[dict]:
-        """日足データ取得（キャッシュあり）"""
+        """日足データ取得（キャッシュあり） /v2/equities/bars/daily"""
         cache_key = f"quotes_{code}_{from_date}_{to_date}"
 
         def fetch():
-            resp = requests.get(
+            return self._get_all_pages(
                 f"{self.BASE_URL}/equities/bars/daily",
-                params={"code": code, "from": from_date, "to": to_date},
-                headers=self._headers(),
-                timeout=30,
+                {"code": code, "from": from_date, "to": to_date},
             )
-            resp.raise_for_status()
-            # V2 レスポンスキーは "bars"
-            return resp.json().get("bars", [])
 
         return _cached(cache_key, fetch, ttl=_cache_ttl)
 
@@ -69,16 +72,19 @@ class JQuantsClient:
             return pd.DataFrame()
 
         df = pd.DataFrame(quotes)
+
+        # V2カラム名(O/H/L/C/Vo) → 内部標準名(Open/High/Low/Close/Volume)
         rename_map = {
             "Date": "Date",
-            "Open": "Open",
-            "High": "High",
-            "Low": "Low",
-            "Close": "Close",
-            "Volume": "Volume",
-            "AdjustmentClose": "AdjClose",
+            "O": "Open",
+            "H": "High",
+            "L": "Low",
+            "C": "Close",
+            "Vo": "Volume",
+            "AdjC": "AdjClose",
         }
         df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+
         if "Date" in df.columns:
             df["Date"] = pd.to_datetime(df["Date"])
             df = df.set_index("Date").sort_index()
@@ -89,31 +95,23 @@ class JQuantsClient:
 
         return df.dropna(subset=["Close"])
 
-    def get_financial_statements(self, code: str) -> list[dict]:
-        """財務データ取得（/fins/statements）"""
+    def get_fins_summary(self, code: str) -> list[dict]:
+        """財務サマリー取得 /v2/fins/summary"""
         cache_key = f"fins_{code}"
 
         def fetch():
-            resp = requests.get(
-                f"{self.BASE_URL}/fins/statements",
-                params={"code": code},
-                headers=self._headers(),
-                timeout=30,
-            )
-            resp.raise_for_status()
-            return resp.json().get("statements", [])
+            return self._get_all_pages(f"{self.BASE_URL}/fins/summary", {"code": code})
 
         return _cached(cache_key, fetch, ttl=86400)
 
     def get_jp_fundamentals(self, code: str, current_price: float) -> dict:
-        """財務データからファンダメンタルズ指標を計算して返す"""
+        """財務サマリーからファンダメンタルズ指標を計算して返す"""
         try:
-            statements = self.get_financial_statements(code)
-            if not statements:
+            summaries = self.get_fins_summary(code)
+            if not summaries:
                 return {}
 
-            # 最新の財務データを使用
-            latest = statements[-1] if statements else {}
+            latest = summaries[-1]
 
             def _safe_float(val):
                 try:
@@ -121,40 +119,32 @@ class JQuantsClient:
                 except Exception:
                     return None
 
-            eps = _safe_float(latest.get("EarningsPerShare"))
-            bps = _safe_float(latest.get("BookValuePerShare"))
-            div_per_share = _safe_float(latest.get("DividendPerShare"))
-            net_sales = _safe_float(latest.get("NetSales"))
-            net_income = _safe_float(latest.get("NetIncome"))
-            equity = _safe_float(latest.get("Equity"))
-            total_liabilities = _safe_float(latest.get("TotalLiabilities"))
-            shares = _safe_float(latest.get("NumberOfIssuedAndOutstandingSharesAtTheEndOfFiscalYearIncludingTreasuryStock"))
+            # V2 /fins/summary のカラム名
+            eps = _safe_float(latest.get("EPS"))
+            bps = _safe_float(latest.get("BPS"))
+            div_ann = _safe_float(latest.get("DivAnn"))
+            sales = _safe_float(latest.get("Sales"))
+            net_profit = _safe_float(latest.get("NP"))
+            equity = _safe_float(latest.get("Eq"))
+            total_assets = _safe_float(latest.get("TA"))
 
             fundamentals: dict = {}
 
-            # PER
             if eps and eps > 0 and current_price > 0:
                 fundamentals["pe_ratio"] = current_price / eps
 
-            # PBR
             if bps and bps > 0 and current_price > 0:
                 fundamentals["pb_ratio"] = current_price / bps
 
-            # 配当利回り
-            if div_per_share and current_price > 0:
-                fundamentals["dividend_yield"] = div_per_share / current_price
+            if div_ann and current_price > 0:
+                fundamentals["dividend_yield"] = div_ann / current_price
 
-            # 利益率
-            if net_income and net_sales and net_sales > 0:
-                fundamentals["profit_margins"] = net_income / net_sales
+            if net_profit and sales and sales > 0:
+                fundamentals["profit_margins"] = net_profit / sales
 
-            # 時価総額
-            if shares and current_price > 0:
-                fundamentals["market_cap"] = shares * current_price
-
-            # D/Eレシオ
-            if total_liabilities and equity and equity > 0:
-                fundamentals["debt_to_equity"] = total_liabilities / equity
+            # D/E = (総資産 - 純資産) / 純資産
+            if total_assets and equity and equity > 0:
+                fundamentals["debt_to_equity"] = (total_assets - equity) / equity
 
             return fundamentals
         except Exception as e:
